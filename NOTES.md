@@ -219,6 +219,35 @@ sm_121a が認識されていることは FlashInfer のキャッシュパスで
 
 動作実績 (2026-09-18): Qwen/Qwen3-0.6B を TP=2 で起動し、spark-153d:8000 で応答を確認。
 
+### Codex CLI から使う
+
+ツール呼び出しが要るので、rank 0 に API サーバー用のオプションを付けて起動する。
+これらを headless の rank 1 に渡すと `unrecognized arguments` で落ち、rank 0 は待ち続ける。
+
+```bash
+API_ARGS="--enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3" \
+  ./vllm-cluster-node.sh 0 Qwen/Qwen3-0.6B   # spark-153d
+./vllm-cluster-node.sh 1 Qwen/Qwen3-0.6B     # spark-5083
+```
+
+Codex 0.155 の `-p <name>` は `~/.codex/<name>.config.toml` を基本設定に重ねる方式。
+
+```toml
+# ~/.codex/spark.config.toml   → codex -p spark
+model_provider = "spark"
+model = "Qwen/Qwen3-0.6B"
+model_context_window = 40960   # 無いと "Model metadata ... not found" の警告
+
+[model_providers.spark]
+name = "DGX Spark vLLM"
+base_url = "http://spark-153d:8000/v1"
+wire_api = "responses"
+```
+
+動作実績 (2026-09-18): Codex → vLLM の Responses API → ツール呼び出し → シェル実行まで通った。
+ただし 0.6B では結果の解釈を誤る (`uname -m` を `x86_64` と答えた)。実用には 30B 級が要る。
+Responses API では `--reasoning-parser` が効かず、`<think>` が本文に出る。
+
 ### GPU が死んでいても vLLM はコンテナ起動までは進む
 
 spark-153d で、ワーカーが `RuntimeError: No CUDA GPUs are available` で落ち続けた。原因は

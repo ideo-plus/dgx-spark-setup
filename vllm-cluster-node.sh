@@ -7,7 +7,11 @@
 #  - イメージに Ray が無いので、vLLM 組み込みの複数ノード (--nnodes / --node-rank) を使う
 #  - ノード間通信は QSFP 直結リンク上の RoCE (setup-qsfp-link.sh で振ったアドレス)
 #  - モデルは両機の ~/.local/share/huggingface に置いておく (オフラインで読む)
-#  - 環境変数: IMAGE, GPU_UTIL (既定 0.2), PORT (既定 8000), NCCL_DEBUG
+#  - 追加オプションのうちエンジン設定 (--max-model-len など) は両機でそろえて引数で渡す。
+#    API サーバー専用のもの (ツール呼び出し・reasoning パーサなど) は headless の rank 1 が
+#    unrecognized arguments で落ちるので、API_ARGS に入れる (rank 0 にだけ渡る)
+#    例: API_ARGS="--enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3"
+#  - 環境変数: IMAGE, GPU_UTIL (既定 0.2), PORT (既定 8000), API_ARGS, NCCL_DEBUG
 #  - 止めるとき: docker rm -f vllm-node (両機)
 set -eu
 
@@ -32,7 +36,11 @@ python3 -c 'import ctypes,sys; sys.exit(ctypes.CDLL("libcuda.so.1").cuInit(0))' 
 }
 
 EXTRA=()
-[ "$RANK" -eq 0 ] || EXTRA=(--headless)
+if [ "$RANK" -eq 0 ]; then
+  read -r -a EXTRA <<< "${API_ARGS:-}"
+else
+  EXTRA=(--headless)
+fi
 
 docker rm -f vllm-node >/dev/null 2>&1 || true
 docker run -d --name vllm-node --network host --gpus all --ipc=host \
