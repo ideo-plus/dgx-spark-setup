@@ -185,6 +185,55 @@ sm_121a が認識されていることは FlashInfer のキャッシュパスで
                                      ^^^^
 ```
 
+### 2 台構成 (tensor parallel 2)
+
+`vllm-cluster-node.sh` を両機で実行する (rank 0 = spark-153d、rank 1 = spark-5083)。
+
+```bash
+./vllm-cluster-node.sh 0 <model>   # spark-153d。API は :8000
+./vllm-cluster-node.sh 1 <model>   # spark-5083。--headless で API は立てない
+```
+
+- **Ray は使わない。** NGC の `vllm:26.08-py3` には Ray が入っていない。代わりに vLLM 組み込みの
+  複数ノード (`--nnodes 2 --node-rank N --master-addr 192.168.100.10`、既定の mp バックエンド) を使う。
+- **通信を直結リンクに固定する。** 以下を外すと LAN (10.0.1.x) 側に流れる。
+  `VLLM_HOST_IP=192.168.100.1x` / `NCCL_SOCKET_IFNAME` と `GLOO_SOCKET_IFNAME` = `enp1s0f0np0` /
+  `NCCL_IB_HCA=rocep1s0f0`。コンテナには `--network host --device /dev/infiniband --cap-add IPC_LOCK
+  --ulimit memlock=-1` を付ける。
+- RoCE で通っているかは `NCCL_DEBUG=INFO` のログで見る。`NET/IB : No device found.` が 1 行出るが、
+  その後に次が出ていれば OK。`NET/Socket` になっていたら TCP に落ちている。
+
+  ```
+  NCCL INFO NET/IB : Using [0]rocep1s0f0:1/RoCE [RO]; OOB enp1s0f0np0:192.168.100.10<0>
+  NCCL INFO Channel 00/0 : 0[0] -> 1[0] [send] via NET/IB/0
+  ```
+
+- 直結リンクの RDMA 帯域は `ib_write_bw` で 1 本あたり約 112 Gb/s (2026-09-18 実測)。
+  今は 1 本 (`rocep1s0f0`) しか使っていない。
+- イメージとモデルは直結リンク経由で 2 台目に送ると速い (25.5GB のイメージで約 4 分)。
+
+  ```bash
+  docker save nvcr.io/nvidia/vllm:26.08-py3 | ssh 192.168.100.11 docker load
+  rsync -a ~/.local/share/huggingface/hub 192.168.100.11:.local/share/huggingface/
+  ```
+
+動作実績 (2026-09-18): Qwen/Qwen3-0.6B を TP=2 で起動し、spark-153d:8000 で応答を確認。
+
+### GPU が死んでいても vLLM はコンテナ起動までは進む
+
+spark-153d で、ワーカーが `RuntimeError: No CUDA GPUs are available` で落ち続けた。原因は
+vLLM ではなく GPU 自体で、起動前から `Xid 119 (GSP Timeout)` で止まっていた (引き金は RDP の Xorg)。
+以後カーネルログに `gpuHandleSanityCheckRegReadError ... 0xbadf5600` が大量に出て、`cuInit` が
+100 を返す。再起動で戻った。
+
+紛らわしい点が 2 つある。
+
+- `torch.cuda.device_count()` は NVML 経由なので GPU が死んでいても `1` を返す。
+  判定は `cuInit` で行う (`vllm-cluster-node.sh` は起動前にこれを確かめる)。
+- NGC イメージの起動バナーに `CUDA failed to initialize ... (error 100)` と出る。正常な機では
+  代わりに `CUDA Forward Compatibility mode ENABLED` と出る。`--entrypoint` を差し替えて
+  試すとこのバナーを見逃す。
+
 ### ollama との併用
 
 ollama とはメモリを取り合うので同時に動かさない。vLLM を使う間は ollama を止める。
@@ -353,20 +402,14 @@ docker run --rm --network bridge nginx:alpine sh -c \
 
 ## 未着手 / 保留
 
-### 2 台直結構成
-
-背面の ConnectX (QSFP) ポートで 2 台を直結する予定。これに伴い:
-
-- 直結リンク用のサブネットを両機に振る (`enP7s7` の LAN 側とは別インターフェース)
-- vLLM は Ray でクラスタを組む形になり、起動方法が変わる
-
-  ```
-  vllm serve <model> --tensor-parallel-size 2 --distributed-executor-backend ray
-  ```
-
-- sparkDash の Head / Worker ロール設定が使えるようになる
-
 ### デーモン化
 
-vLLM の systemd 化は**この直結構成が決まってから**。単体起動用のユニットを今書いても、
-Ray クラスタを起こしてから serve する形に書き直しになるため。
+vLLM の常駐化 (systemd か compose) はまだ。2 台構成の起動方法は `vllm-cluster-node.sh` で固まった。
+
+### 2 本目の直結リンクを使う
+
+`NCCL_IB_HCA` に `roceP2p1s0f0` (192.168.101.x) も足せば帯域を倍にできる見込み。未検証。
+
+### sparkDash の Head / Worker ロール
+
+直結構成ができたので設定できる。未着手。
