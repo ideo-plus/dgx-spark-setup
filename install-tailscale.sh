@@ -1,7 +1,9 @@
 #!/bin/bash
 # Tailscale を公式 apt リポジトリから入れて tailscaled を有効化する。
 #  - 使い方: sudo ./install-tailscale.sh [tailscale up に渡す追加オプション...]
-#    例: sudo ./install-tailscale.sh --ssh
+#    例: sudo ./install-tailscale.sh --accept-routes
+#  - --ssh (Tailscale SSH) は付けない。tailnet 経由の 22 番を Tailscale が横取りし、
+#    ACL が check モードだとブラウザ認証待ちで止まる。ssh は普通の sshd + 鍵で行う
 #  - ログインは表示される URL をブラウザで開いて行う。ログイン済みなら up はスキップ
 #  - 冪等 (再実行するとリポジトリ定義を上書きして apt で最新化する)
 set -eu

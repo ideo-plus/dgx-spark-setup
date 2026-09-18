@@ -2,7 +2,14 @@
 
 ハマりどころと、その原因・対処の記録。手順そのものより「なぜそうしたか」を残す。
 
-対象機: `spark-153d` / GB10 (Grace + Blackwell, aarch64) / Ubuntu 24.04 (DGX OS) /
+対象機は 2 台。ホスト名は DGX OS の初期値 (シリアル由来) のまま使っている。
+
+| # | ホスト名 | LAN (`enP7s7`) | QSFP 直結 (`enp1s0f0np0` / `enP2p1s0f0np0`) | Tailscale |
+|---|---|---|---|---|
+| 1 | `spark-153d` | 10.0.1.60 | 192.168.100.10 / 192.168.101.10 | 100.109.104.27 |
+| 2 | `spark-5083` | 10.0.1.61 | 192.168.100.11 / 192.168.101.11 | 100.95.207.79 |
+
+共通: GB10 (Grace + Blackwell, aarch64) / Ubuntu 24.04 (DGX OS) /
 カーネル `7.0.0-1019-nvidia` / CUDA 13.0 / compute capability **12.1 (sm_121)** /
 ユニファイドメモリ 128GB。
 
@@ -281,6 +288,25 @@ ComfyUI / Hermes / Tailnet の監視は既定オフ。
 sparkDash が ComfyUI を起動するわけではない。**既に動いている ComfyUI を覗きに行く**
 オプトイン機能 (`comfyMonitoring`、既定オフ、既定ポート 8188)。ComfyUI 自体は
 画像・動画生成のノードベース UI で、LLM とは用途が別。使っていないなら有効にする意味はない。
+
+---
+
+## Tailscale
+
+### Tailscale SSH (`--ssh`) は有効にしない
+
+`tailscale up --ssh` にすると、tailnet 経由で来た 22 番への接続を sshd ではなく
+tailscaled が受ける。ACL の ssh ルールが `check` モードだと、公開鍵を持っていても
+ブラウザでの追加認証を要求され、`BatchMode` の ssh は無言で止まる。
+
+```
+# Tailscale SSH requires an additional check.
+# To authenticate, visit: https://login.tailscale.com/a/...
+```
+
+QSFP 直結 IP (`192.168.10x.x`) 宛ては tailnet を通らないので通る、という非対称な症状になる。
+`spark-5083` で一度これを踏んだ。対処は `sudo tailscale set --ssh=false` で、
+以後は普通の sshd + `~/.ssh/id_ed25519.tailnet` で認証する。
 
 ---
 
