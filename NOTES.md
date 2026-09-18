@@ -236,32 +236,63 @@ sm_121a が認識されていることは FlashInfer のキャッシュパスで
 
 ### Codex CLI から使う
 
-ツール呼び出しが要るので、rank 0 に API サーバー用のオプションを付けて起動する。
-これらを headless の rank 1 に渡すと `unrecognized arguments` で落ち、rank 0 は待ち続ける。
+今のモデルは `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8` (31GB、1 ノード 14.8GiB、KV 55 万トークン)。
+0.6B ではツールを選べず実用にならなかった。
 
 ```bash
-API_ARGS="--enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3" \
-  ./vllm-cluster-node.sh 0 Qwen/Qwen3-0.6B   # spark-153d
-./vllm-cluster-node.sh 1 Qwen/Qwen3-0.6B     # spark-5083
+M=Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+GPU_UTIL=0.4 API_ARGS="--enable-auto-tool-choice --tool-call-parser qwen3_coder" \
+  ./vllm-cluster-node.sh 0 $M   # spark-153d
+GPU_UTIL=0.4 ./vllm-cluster-node.sh 1 $M     # spark-5083
 ```
+
+API サーバー専用のオプションを headless の rank 1 に渡すと `unrecognized arguments` で落ち、
+rank 0 は待ち続ける。だから `API_ARGS` に分けている。
 
 Codex 0.155 の `-p <name>` は `~/.codex/<name>.config.toml` を基本設定に重ねる方式。
 
 ```toml
 # ~/.codex/spark.config.toml   → codex -p spark
 model_provider = "spark"
-model = "Qwen/Qwen3-0.6B"
-model_context_window = 40960   # 無いと "Model metadata ... not found" の警告
+model = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+model_context_window = 262144   # 無いと "Model metadata ... not found" の警告
 
 [model_providers.spark]
 name = "DGX Spark vLLM"
 base_url = "http://spark-153d:8000/v1"
 wire_api = "responses"
+
+[mcp_servers.searxng]
+command = "npx"
+args = ["-y", "mcp-searxng@2.3.0"]
+startup_timeout_sec = 60
+env = { SEARXNG_URL = "http://spark-153d:8080", SEARXNG_LITE_TOOLS = "true", SEARXNG_MAX_RESULTS = "5" }
+
+[mcp_servers.searxng.tools.searxng_web_search]
+approval_mode = "approve"
+[mcp_servers.searxng.tools.web_url_read]
+approval_mode = "approve"
 ```
 
-動作実績 (2026-09-18): Codex → vLLM の Responses API → ツール呼び出し → シェル実行まで通った。
-ただし 0.6B では結果の解釈を誤る (`uname -m` を `x86_64` と答えた)。実用には 30B 級が要る。
-Responses API では `--reasoning-parser` が効かず、`<think>` が本文に出る。
+### Web 検索は MCP + SearXNG で行う
+
+Codex の `--search` (Claude Code の WebSearch も同じ) は **API サーバー側で実行されるツール**。
+vLLM はこれを実行せず、しかもエラーにもせず黙って無視する。モデルは検索したふりをして答えを作る。
+なので検索はハーネス側で動く MCP サーバーに任せる。
+
+```
+Codex ──MCP──→ mcp-searxng ──HTTP──→ SearXNG (spark-153d:8080) ──→ Google / Bing など
+```
+
+- SearXNG は spark-153d の `~/searxng` (compose、`restart: always`)。API キー不要。
+  MCP から JSON で叩くので `settings.yml` の `search.formats` に `json` を足す。`limiter: false`。
+  ポート 8080 は LAN / tailnet 向け。ルーターで外に開けないこと。
+- `mcp-searxng` は検索 (`searxng_web_search`) とページ読み取り (`web_url_read`) の両方を持つ。
+  `SEARXNG_LITE_TOOLS=true` で検索の引数がクエリだけになり、小さいモデルでも扱いやすい。
+- **MCP ツールは呼ぶたびに承認が要る。** `codex exec` (承認ポリシー never) では
+  `MCP tool call requires approval, but approval policy is never` で失敗し、モデルは
+  「検索できない」と答えるだけになる。読み取り専用の 2 つは `approval_mode = "approve"` にした。
+- 動作実績 (2026-09-18): 「DGX Spark のメモリ容量」を検索し、出典 4 件付きで 128GB と回答。
 
 ### GPU が死んでいても vLLM はコンテナ起動までは進む
 
