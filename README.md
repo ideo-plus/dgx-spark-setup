@@ -8,6 +8,8 @@ DGX Spark (GB10 / Ubuntu 24.04) のセットアップ用スクリプトとメモ
 |---|---|
 | `install-cjk-fix.sh` | App Center (snap-store) の日本語が豆腐になるのを回避する |
 | `xdg-english-dirs.sh` | XDG のユーザーディレクトリ名を英語に固定する |
+| `setup-qsfp-link.sh` | 2 台の DGX Spark を QSFP 直結したリンクに固定 IP を振る |
+| `install-tailscale.sh` | Tailscale を公式 apt リポジトリから入れて tailscaled を有効化する |
 
 ## メモ
 
