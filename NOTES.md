@@ -280,7 +280,8 @@ const result = authenticate(req);                        // → 全 GET が認�
 | ファイル | 内容 |
 |---|---|
 | `~/sparkDash/.env` | `PORT=5556` / `BIND_HOST=127.0.0.1` |
-| `~/sparkDash/docker-compose.override.yml` | `PORT` を 5556 に上書き |
+| `~/sparkDash/docker-compose.override.yml` | `PORT` を 5556 に上書き / worker 監視用の SSH 鍵をマウント |
+| `~/sparkDash/config/sparks.json` | 監視対象とロール (UI か `/api/sparks` で編集する) |
 | `~/sparkdash-proxy/` | `nginx.conf` / `.htpasswd` / `docker-compose.yml` |
 
 `docker-compose.override.yml` が必要なのは、本体の compose が `PORT=5555` を
@@ -291,7 +292,31 @@ services:
   sparkdash:
     environment:
       - PORT=5556
+    volumes:
+      - ${HOME}/.ssh/id_ed25519.tailnet:/root/.ssh/id_ed25519:ro
 ```
+
+### 2 台構成 (Head / Worker)
+
+sparkDash は spark-153d だけで動かし、spark-5083 は SSH で監視する。
+
+| id | ホスト | ロール | 監視方法 | LLM 監視 |
+|---|---|---|---|---|
+| `spark1` | spark-153d | head | ローカル (`isLocal`) | ポート 8000 (vLLM rank 0) |
+| `spark2` | spark-5083 | worker (`workerHeadId: spark1`) | SSH `j5ik2o@10.0.1.61` | なし |
+
+- SSH は**コンテナ内から**張られる。ホストの `~/.ssh` は見えないので、鍵を
+  `/root/.ssh/id_ed25519` という既定名でマウントする。パスフレーズ付きの鍵は使えない (BatchMode)。
+- LLM ポートの既定は 8888。vLLM は 8000 で立てているので head 側を 8000 に直す。
+- worker の表示ラベルは head の LLM から検出したモデル名が自動で入る。
+- 追加・変更は UI の代わりに API でもできる (ループバックなのでトークン不要)。
+
+  ```bash
+  curl -X POST  127.0.0.1:5556/api/sparks/test   -H 'Content-Type: application/json' -d @spark2.json
+  curl -X POST  127.0.0.1:5556/api/sparks        -H 'Content-Type: application/json' -d @spark2.json
+  curl -X PATCH 127.0.0.1:5556/api/sparks/spark1 -H 'Content-Type: application/json' -d '{"role":"head"}'
+  curl -X PUT   127.0.0.1:5556/api/sparks/spark1/llm-ports -H 'Content-Type: application/json' -d '{"llmPorts":[8000]}'
+  ```
 
 ### 落とし穴
 
@@ -409,7 +434,3 @@ vLLM の常駐化 (systemd か compose) はまだ。2 台構成の起動方法�
 ### 2 本目の直結リンクを使う
 
 `NCCL_IB_HCA` に `roceP2p1s0f0` (192.168.101.x) も足せば帯域を倍にできる見込み。未検証。
-
-### sparkDash の Head / Worker ロール
-
-直結構成ができたので設定できる。未着手。
