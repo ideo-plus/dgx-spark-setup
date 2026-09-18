@@ -96,6 +96,21 @@ else
   write_dirs_file
 fi
 
+# 5) Files (Nautilus) サイドバーのブックマークも英語パスへ(URL エンコード済みの旧パスを置換)
+BM="$CONF_DIR/gtk-3.0/bookmarks"
+if [ -f "$BM" ]; then
+  for kv in デスクトップ:Desktop ダウンロード:Downloads テンプレート:Templates \
+            公開:Public ドキュメント:Documents ミュージック:Music \
+            ピクチャ:Pictures ビデオ:Videos; do
+    ja=${kv%%:*}; en=${kv##*:}
+    enc=$(printf '%s' "$ja" | od -An -tx1 -v | tr -d ' \n' | sed 's/../%\U&/g')
+    # 区切りに | を使うと \| (選択) が効かなくなるので # を使う
+    sed -i -e "s#file://$HOME/$enc\\([[:space:]]\\|\$\\)#file://$HOME/$en\\1#" \
+           -e "s#file://$HOME/$ja\\([[:space:]]\\|\$\\)#file://$HOME/$en\\1#" "$BM"
+  done
+  echo "ブックマーク更新: $BM"
+fi
+
 echo '--- user-dirs.dirs ---'
 grep ^XDG "$DIRS"
 echo '--- 反映確認 ---'
