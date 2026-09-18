@@ -13,11 +13,26 @@
 カーネル `7.0.0-1019-nvidia` / CUDA 13.0 / compute capability **12.1 (sm_121)** /
 ユニファイドメモリ 128GB。
 
-物理モニタは接続していない (headless)。この前提が RDP の構成を決めている。
+物理モニタは接続していない (headless)。画面も起動しない (`multi-user.target`)。
 
 ---
 
 ## リモートデスクトップ (RDP)
+
+> **2026-09-18 に両機とも RDP をやめ、画面なし (`multi-user.target`) にした。**
+> spark-153d で RDP 用の Xorg が引き金になって GPU が `Xid 119 (GSP Timeout)` で止まり、
+> 再起動まで CUDA が使えなくなったため (「GPU が死んでいても vLLM はコンテナ起動までは進む」参照)。
+> 2 台構成の推論ではメモリも GPU も推論に回したい。以下は戻すときのための記録。
+>
+> ```bash
+> # やめたときの手順
+> sudo grdctl --system rdp disable
+> sudo systemctl disable --now gnome-remote-desktop.service
+> sudo systemctl set-default multi-user.target && sudo systemctl isolate multi-user.target
+> # 戻す
+> sudo systemctl set-default graphical.target && sudo grdctl --system rdp enable
+> sudo systemctl enable --now gnome-remote-desktop.service
+> ```
 
 ### 画面共有ではなくリモートログインを使う
 
