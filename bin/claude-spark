@@ -1,0 +1,49 @@
+#!/bin/bash
+# DGX Spark 上の vLLM (Anthropic 互換の /v1/messages) に Claude Code をつなぐ。Mac で使う。
+#  - 使い方: claude-spark [claude の引数...]      例: claude-spark -c
+#  - 接続先は SPARK_URL。未指定なら spark-153d の 8000 と 8001 を順に試し、応答した方を使う
+#    (Qwen3.8 / DeepSeek は 8000、GLM-5.3-Flash は 8001。どちらか一方しか動かさない前提)
+#  - モデル名は SPARK_MODEL。未指定ならサーバーの /v1/models から取る
+#  - 補助的な呼び出し (haiku / サブエージェント) も同じモデルに向ける。
+#    向けないと存在しないモデル名で 404 になる
+#  - WebSearch は Anthropic 側で実行されるツールなので vLLM では動かない。無効にして、
+#    ~/.claude/spark-mcp.json があれば SearXNG の MCP を読み込む (NOTES.md「Web 検索は MCP + SearXNG で行う」)
+set -u
+
+HOST=${SPARK_HOST:-spark-153d}
+MCP_CONFIG=${SPARK_MCP_CONFIG:-$HOME/.claude/spark-mcp.json}
+
+first_model() {   # <url> -> /v1/models の最初の id
+    # 応答は 1 行の JSON で、後ろに permission の "id" も並ぶ。最初の "id" がモデル名
+    curl -s -m 5 "$1/v1/models" | grep -o '"id" *: *"[^"]*"' | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+url=${SPARK_URL:-}
+model=${SPARK_MODEL:-}
+if [ -z "$url" ]; then
+    for port in 8000 8001; do
+        m=$(first_model "http://$HOST:$port")
+        if [ -n "$m" ]; then url="http://$HOST:$port"; [ -n "$model" ] || model=$m; break; fi
+    done
+elif [ -z "$model" ]; then
+    model=$(first_model "$url")
+fi
+if [ -z "$url" ] || [ -z "$model" ]; then
+    echo "claude-spark: ${url:-$HOST:8000/8001} のモデルが応答しない (起動中か停止中)" >&2
+    exit 1
+fi
+echo "claude-spark: $url  model: $model" >&2
+
+args=(--disallowedTools WebSearch)
+[ -f "$MCP_CONFIG" ] && args+=(--mcp-config "$MCP_CONFIG")
+
+export ANTHROPIC_BASE_URL=$url
+export ANTHROPIC_AUTH_TOKEN=dummy
+export ANTHROPIC_MODEL=$model
+export ANTHROPIC_DEFAULT_OPUS_MODEL=$model
+export ANTHROPIC_DEFAULT_SONNET_MODEL=$model
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=$model
+export CLAUDE_CODE_SUBAGENT_MODEL=$model
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export API_TIMEOUT_MS=600000
+exec claude "${args[@]}" "$@"

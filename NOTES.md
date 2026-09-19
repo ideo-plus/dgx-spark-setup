@@ -274,6 +274,32 @@ approval_mode = "approve"
 approval_mode = "approve"
 ```
 
+### Claude Code から使う
+
+vLLM 0.27 は Anthropic 互換の `/v1/messages` を持つ (`vllm/entrypoints/anthropic`)。ストリーミングと
+`tool_use`、`count_tokens` も通る (2026-09-18、Qwen3-Coder-30B で確認)。環境変数で接続先を差し替える。
+
+`bin/claude-spark` (シェルスクリプト) を使う。Mac で `PATH` に通す (例: `ln -s ~/dgx-spark-setup/bin/claude-spark ~/bin/`)。
+
+```bash
+claude-spark                                  # spark-153d の 8000 → 8001 の順に試し、応答した方につなぐ
+claude-spark -c                               # claude の引数はそのまま渡る
+SPARK_URL=http://spark-153d:8001 claude-spark # 接続先を固定する
+SPARK_MODEL=glm-5.3-flash claude-spark        # モデル名を固定する (未指定なら /v1/models の最初の id)
+```
+
+- `/v1/models` の応答は 1 行の JSON で、後ろに permission の `"id"` (`modelperm-…`) も並ぶ。
+  最後の `"id"` を拾うと、このモデルではない ID になる。最初の `"id"` がモデル名。
+
+- haiku 相当の補助的な呼び出し (タイトル生成、WebFetch の要約) も同じモデルに向ける。そうしないと、存在しないモデル名で 404 になる。
+- `WebSearch` はサーバー側で実行されるツールなので、vLLM では動かない (下記)。無効化し、代わりに SearXNG の MCP を使う。
+
+```json
+// ~/.claude/spark-mcp.json
+{"mcpServers":{"searxng":{"command":"npx","args":["-y","mcp-searxng@2.3.0"],
+  "env":{"SEARXNG_URL":"http://spark-153d:8080","SEARXNG_LITE_TOOLS":"true","SEARXNG_MAX_RESULTS":"5"}}}}
+```
+
 ### Web 検索は MCP + SearXNG で行う
 
 Codex の `--search` (Claude Code の WebSearch も同じ) は **API サーバー側で実行されるツール**。
@@ -312,6 +338,167 @@ vLLM ではなく GPU 自体で、起動前から `Xid 119 (GSP Timeout)` で止
 ### ollama との併用
 
 ollama とはメモリを取り合うので同時に動かさない。vLLM を使う間は ollama を止める。
+
+---
+
+## モデルの切り替え (`spark-model.sh`)
+
+各レシピの起動コマンドは長いので、`spark-model.sh` にまとめた。いま動いているもの (DeepSeek、Qwen3.8、
+`vllm-cluster-node.sh` の `vllm-node`) を止めてから起動する。API はどれもポート 8000。
+
+```bash
+ssh spark-153d dgx-spark-setup/spark-model.sh qwen       # Qwen3.8-Flash-Next (qwen3.8-flash-next)
+ssh spark-153d dgx-spark-setup/spark-model.sh deepseek   # DeepSeek-V4.1-Flash (DeepSeek-v4.1-Flash-EXL3)
+ssh spark-153d dgx-spark-setup/spark-model.sh status
+ssh spark-153d -t dgx-spark-setup/spark-model.sh logs
+ssh spark-153d dgx-spark-setup/spark-model.sh stop
+```
+
+---
+
+## DeepSeek-V4.1-Flash (EXL3 2.9bpw, TP=2)
+
+レシピは <https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks> (`~/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks`、
+spark-153d)。重みは 1 ノードあたり約 99.5GiB で、起動には `MemAvailable` が重み + 12GiB 必要 (`check_memory_headroom`)。
+
+### 重みのダウンロード
+
+- `download.sh` は `model/` が無いと何も出さずに終わる。`set -o pipefail` の下で `find` が失敗するため。
+  先に `mkdir -p model engram-src` しておく。
+- spark-153d には `hf` コマンドが無いので、`.hfshim/hf` (uvx 経由のラッパー) を `PATH` の先頭に置いて実行する。
+- xet は受信したチャンクをまとめて書き出す。`du` を数十秒おきに測っても速度はわからない。
+  完了したファイル数 (`ls model/*.safetensors | wc -l`、39 で完了) で見る。
+- 実績 (2026-09-18): HF_TOKEN なしで平均約 37MiB/s。EXL3 197GiB が 17:21〜18:50、Engram 190GiB
+  (シャード 47/48 が各 約 95GiB) が 18:50〜20:18。途中で `Connection reset` が出るが、xet が再試行するので止まらない。
+- 落ちたときや止まったときのために `watch-download.sh` (見張り、未コミットのローカルファイル) を `setsid` で動かした。
+  `download-watch.log` に状態を書く。`DONE` で終了。
+- **Engram に `config.json` が要るのに、`download.sh` はこれを取らない** (取るのはシャード 47/48 と index だけ)。
+  起動すると、重みの読み込みで `FileNotFoundError: '/engram-src/config.json'` になる。元のリポジトリから取って、
+  `engram-src/`、head の `~/.cache/vllm-dsv41-flash-exl3/engram-src/`、worker の engram-src の 3 か所に置く。
+
+  ```bash
+  hf download deepseek-ai/DeepSeek-V4.1-Flash config.json --local-dir engram-src
+  ```
+- 重みの予算は `scripts/weight_budget.py --model model --tp 2` で 1 ランクあたり 99.48GiB (routed experts が 91.29GiB)。
+
+### `.env` で直すところ
+
+作者の環境 (`10.0.0.x`、`enp1s0f1np1`) の値になっているので、この 2 台に合わせる。
+
+| 変数 | 値 |
+|---|---|
+| `HEAD_IP` / `WORKER_IP` | `192.168.100.10` / `192.168.100.11` |
+| `HEAD_CX7_IF` / `WORKER_CX7_IF` | どちらも `enp1s0f0np0` |
+| `HEAD_CX7_IB` / `WORKER_CX7_IB` | どちらも `rocep1s0f0` |
+| `NCCL_IB_GID_INDEX` | `5` (2 台とも)。既定の `3` は `fe80::` のリンクローカル |
+| `WORKER_USER` | `j5ik2o` |
+| `PORT` | `8000` (既定は 8888)。sparkDash と Claude Code の接続先をそのまま使える |
+| `NFS_CLIENTS` | `192.168.100.11` (既定は `/24` 全体) |
+
+GID は `/sys/class/infiniband/rocep1s0f0/ports/1/gids/N` と `gid_attrs/types/N` で見る。
+`::ffff:192.168.100.1x` かつ `RoCE v2` の行を選ぶ (2 台とも index 5)。
+
+### 起動の実績 (2026-09-18)
+
+```bash
+SKIP_BUILD=1 SKIP_PULL=1 setsid -f ./start.sh > logs/start.out 2>&1 < /dev/null   # WEIGHT_SYNC=rsync
+```
+
+- コンテナの起動から「is UP」まで約 6 分。重みの読み込みに約 5 分、エンジンの初期化 (KV 確保、ウォームアップ) に 75 秒。
+- 起動後の空きメモリ (`MemAvailable`) は head 4GiB、worker 6GiB。この状態で Claude Code を Spark 上で動かすのは避ける。
+- 生成速度: 1 リクエスト、思考なしで 600 トークンを 16.9 秒 (約 35 tok/s、DSpark k=3)。
+- `/v1/messages` で `thinking` と `tool_use` のブロックが返る。Claude Code から使える。
+- 起動後のウォームアップで `sampler-cache postcondition UNMET` という警告が出る。止まる問題ではない (nonfatal)。
+  まだコンパイルされていない top-k/top-p の組み合わせが来たとき、その場で JIT コンパイルするので、初回だけ遅くなる。
+
+### 思考 (thinking) をサーバー側でオフにする
+
+DeepSeek のチャットテンプレートは、既定で思考がオンになっている。Claude Code は 1 つの作業で何往復もやり取りし、
+そのたびに数百トークンの思考を出すので、とても遅い (約 30 tok/s)。vLLM の `/v1/messages` は、リクエストの
+`thinking` の指定を無視する。そのため、クライアント側では止められない。サーバーの既定値で止める。
+
+```bash
+# .env
+EXTRA_ARGS='--default-chat-template-kwargs {"enable_thinking":false}'   # JSON にスペースを入れない (空白で分割される)
+```
+
+`EXTRA_ARGS` は headless の worker にも渡るが、このオプションは受け付けられて起動する。
+ツール呼び出し 1 往復が約 1.7 秒になった。ただし、再起動後の最初の 1 回は 22 秒かかった
+(サンプラーのカーネルを、その場で JIT コンパイルするため)。
+
+### イメージは head で取得し、直結リンクで worker に送る
+
+2 台で同時に `docker pull` すると、同じインターネット回線を取り合うだけになる。head で取得してから送る。
+
+```bash
+docker pull $IMG && docker save $IMG | ssh 192.168.100.11 docker load   # 22.5GB
+```
+
+`start.sh` は、イメージのレイヤー (`RootFS.Layers`) が 2 台で一致すれば送り直さない。
+
+**`SKIP_BUILD=1 SKIP_PULL=1 ./start.sh` で起動する。** 公開イメージ (2026-09-12 ビルド) のラベル
+`dsv41.recipe.stamp` が、リポジトリ (09-13、09-16 のコミット) から計算したハッシュと一致しない。
+このままだと `start.sh` が「レシピが変わった」とみなし、exllamav3 をローカルでビルドし直す。
+ただし、`Dockerfile` が `COPY` する 44 ファイルは、イメージの中身とすべて同一だった (2026-09-18 に `cmp` で確認)。
+ハッシュの差は、イメージに入らないファイルから来ている。
+
+### NFS は使えない。`WEIGHT_SYNC=rsync` にする
+
+既定の `WEIGHT_SYNC=nfs` は、この 2 台では失敗する。
+
+```
+exportfs: /export does not support NFS export
+[dsv41-exl3] ERROR: NFS server did not become ready.
+```
+
+NFS コンテナが公開しようとする `/export` は、コンテナの rootfs (docker の overlay2) の上にある。
+カーネルの nfsd は overlayfs を公開できない。作者の環境 (ZFS の上の docker) では通るのだと思われる。
+コンテナは `--restart unless-stopped` なので、失敗したまま再起動を繰り返す。`docker rm -f dsv41-exl3-nfs` で消す。
+
+代わりに `WEIGHT_SYNC=rsync` にして、worker にローカルコピーを置く (EXL3 と slim Engram で 387GiB)。
+送り先は worker の `~/.cache/dsv41-flash-exl3/{model,engram-src}`。直結リンク越しの rsync を 2 本並列にして、
+約 590MiB/s 出た。
+
+以下は nfs 方式の仕組みの記録。
+
+### NFS に sudo は要らない
+
+`WEIGHT_SYNC=nfs` はホストの nfs-server を使わない。head で `--privileged --network host` の
+alpine コンテナ (`dsv41-exl3-nfs`) を立て、その中でカーネル nfsd を動かす。worker 側は
+docker の `local` ドライバで NFS ボリュームを作ってマウントするので、こちらも sudo は要らない。
+
+- エクスポートは `ro,no_root_squash,insecure`。ACL は既定で `192.168.100.0/24` と `WORKER_IP`。
+- このコンテナは `--restart unless-stopped`。**`stop.sh` では止まらず、再起動後も立ち上がる。**
+  不要になったら `docker rm -f dsv41-exl3-nfs`。
+
+---
+
+## Qwen3.8-Flash-Next (NVFP4, TP=2)
+
+レシピは <https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks> (`~/Qwen3.8-Flash-Next-Dual-DGX-Sparks`)。
+重みは `nvidia/Qwen3.8-Flash-Next-NVFP4` (123.6GiB、HF_TOKEN なしで約 38MiB/s、約 56 分)。
+イメージは vLLM 公式の `vllm/vllm-openai:qwen38-flash-next`。重みの配り方は rsync が既定で、sudo も特権コンテナも使わない。
+
+### `.env` で直すところ
+
+`HEAD_IP` / `WORKER_IP` (192.168.100.10 / .11)、`WORKER_USER=j5ik2o`、`IB_GID_INDEX=5`、`PORT=8000` に加えて、次の 2 つ。
+
+- `HF_HOME="/home/j5ik2o/.local/share/huggingface"`。この 2 台は HF のキャッシュを標準とは違う場所に置いている。
+  未設定だと `~/.cache/huggingface` を探し、重みがないと判断してダウンロードからやり直す。
+- `EXTRA_VLLM_ARGS="--default-chat-template-kwargs '{\"enable_thinking\":false}'"`。思考をオフにする (DeepSeek と同じ理由)。
+
+### huggingface_hub 1.32 は blobs を HF キャッシュ全体で共有する
+
+`hub/models--org--name/blobs/*` は、`hub/blobs/xx/<sha256>` へのシンボリックリンクになっている。
+モデルのディレクトリの `du` は 9.9M しか出ない。`du -shL snapshots/*/` なら 124G。
+**モデルのディレクトリだけを rsync すると、worker にはリンク切れのリンクしか届かない** (`start.sh` の rsync も同じ)。
+`hub/blobs/` も一緒に送る。
+
+```bash
+H=$HF_HOME/hub
+rsync -a --partial $H/blobs/ 192.168.100.11:$H/blobs/
+rsync -a --partial $H/models--nvidia--Qwen3.8-Flash-Next-NVFP4/ 192.168.100.11:$H/models--nvidia--Qwen3.8-Flash-Next-NVFP4/
+```
 
 ---
 
