@@ -407,6 +407,9 @@ SKIP_BUILD=1 SKIP_PULL=1 setsid -f ./start.sh > logs/start.out 2>&1 < /dev/null 
 - コンテナの起動から「is UP」まで約 6 分。重みの読み込みに約 5 分、エンジンの初期化 (KV 確保、ウォームアップ) に 75 秒。
 - 起動後の空きメモリ (`MemAvailable`) は head 4GiB、worker 6GiB。この状態で Claude Code を Spark 上で動かすのは避ける。
 - 生成速度: 1 リクエスト、思考なしで 600 トークンを 16.9 秒 (約 35 tok/s、DSpark k=3)。
+  サンプル数は 1 (日本語で LRU キャッシュの実装と解説を頼んだもの、`max_tokens` 600)。
+  別に、Claude Code で使っていた 15 分間のサーバーログ (10 秒ごとの集計、1 本だけ処理していた 21 区間) では、
+  中央値 32 tok/s、最大 47 tok/s。
 - `/v1/messages` で `thinking` と `tool_use` のブロックが返る。Claude Code から使える。
 - 起動後のウォームアップで `sampler-cache postcondition UNMET` という警告が出る。止まる問題ではない (nonfatal)。
   まだコンパイルされていない top-k/top-p の組み合わせが来たとき、その場で JIT コンパイルするので、初回だけ遅くなる。
@@ -499,6 +502,164 @@ H=$HF_HOME/hub
 rsync -a --partial $H/blobs/ 192.168.100.11:$H/blobs/
 rsync -a --partial $H/models--nvidia--Qwen3.8-Flash-Next-NVFP4/ 192.168.100.11:$H/models--nvidia--Qwen3.8-Flash-Next-NVFP4/
 ```
+
+---
+
+## GLM-5.3-Flash (EXL3 4.05bpw, TP=2)
+
+レシピは <https://github.com/NNNtrance/GLM-5.3-Flash-EXL3-DGX-Spark> (`~/GLM-5.3-Flash-EXL3-DGX-Spark`、
+Apache-2.0) の **TP=2 track の candidate D** (`tracks/tp2/`、`docs/15`)。vLLM に cuda-exl3 と DFlash2 の移植を載せ、
+NCCL の mesh プラグインで **2 本の QSFP ケーブルを両方**使う。API はポート **8001**、モデル名 `glm-5.3-flash`。
+
+| 部品 | 入手先 | 置き場所 (2 台とも同じパス) |
+|---|---|---|
+| 本体 | `turboderp/GLM-5.3-Flash-exl3` rev `2a30229e` (branch 4.05bpw、165GB、MIT) | `~/models/glm-5.3-flash-exl3-4.05bpw` |
+| ドラフター | `incoai/GLM-5.3-Flash-DFlash2` rev `dc77ff1c` (2.3GB) | `~/models/dflash2-draft-tp2` |
+| チャットテンプレート | `zai-org/GLM-5.3-Flash` rev `690b7052` (sha256 `0c4099f3…`) | `~/exl3-zeus/chat_template.jinja` |
+| イメージ | 手元でビルド (下記) | `exl3-zeus:754421f` |
+| mesh プラグイン | `autoscriptlabs/nccl-mesh-plugin` `19924dcc` + `patches/kernel/0004〜0006` | `~/nccl-mesh/libnccl-net-mesh.so` |
+| パッチの木 | `tracks/tp2/patches/` + tp3 からの 4 ファイル | `~/exl3-zeus/tp2d/` |
+| env ファイル | `tracks/tp2/env.tp2-full.example` を sed | `~/exl3-zeus/.env.tp2-full` |
+
+- **ドラフターのライセンスは CC BY-NC-ND 4.0 (非商用、改変不可)**。個人での検証には使えるが、業務では使えない。
+- 本体は `--local-dir` で置く。起動スクリプトはディレクトリを 1 つだけマウントし、HF はオフラインで動く。
+  HF キャッシュの `snapshots/` はリンクなので、コンテナの中ではリンク切れになる。
+
+### イメージ: `Dockerfile.gb10v8` は公開されていないので作り直す
+
+手順 (`docs/02`) は cuda-exl3 の `docker/Dockerfile.gb10v8` を使うが、上流にも、このリポジトリにも無い
+(作者も `docs/02` §10 で「未公開」と書いている)。上流にある `docker/Dockerfile.sparse-mla` を元に作り直した。
+
+```dockerfile
+ARG BASE
+FROM ${BASE}
+ARG ARCH=12.1
+ENV TORCH_CUDA_ARCH_LIST=${ARCH}
+COPY . /opt/cuda-exl3
+RUN cd /opt/cuda-exl3 && rm -rf build *.egg-info && \
+    MAX_JOBS=1 pip install . --no-build-isolation --no-deps && \
+    python3 -c "import cuda_exl3; print('cuda-exl3', cuda_exl3.__version__)"
+```
+
+```bash
+# ベース: vllm/vllm-openai@sha256:905c0293… を pull して glm53-flash-arm64-cu130 とタグを付ける (31GB)
+DOCKER_BUILDKIT=0 docker build --memory=4g --memory-swap=4g -f docker/Dockerfile.gb10v8 \
+  --build-arg BASE=vllm/vllm-openai:glm53-flash-arm64-cu130 --build-arg ARCH=12.1 -t exl3-zeus:serve-754421f .
+DOCKER_BUILDKIT=0 docker build --memory=4g --memory-swap=4g --build-arg BASE=exl3-zeus:serve-754421f \
+  -t exl3-zeus:754421f ~/exl3-zeus/dflash2-port      # リポジトリの patches/dflash2-port のコピー
+```
+
+- `--memory` を効かせるため、旧来のビルダー (`DOCKER_BUILDKIT=0`) を使う。BuildKit ではこの上限が効かない。
+  上限が効かないと、コンパイルが別のサーバーのメモリまで食い、OOM でそちらを落としかねない。
+- ほかのサーバーが動いていて空きメモリが 8GiB しかなかったので、`MAX_JOBS` は 1 にした。それでも 1 層目は約 1.5 分で済んだ。
+- 検査: ビルド中に `DFLASH2 PORT BUILD GATE: OK` と出る。cuda-exl3 のテスト (`pytest tests/`) は **44 passed / 41 skipped** で、作者と同じ。
+  ほかのサーバーが動いている間は、`test_exl3_moe_glu.py` の 8 件が `CUDA error: out of memory` で落ちる。
+- イメージは head でビルドし、`docker save | ssh 192.168.100.11 docker load` で worker に送った。
+  ID が 2 台で一致すること (高速起動のキャッシュの識別子にイメージのタグが入る)。
+
+### mesh プラグイン
+
+```bash
+git clone https://github.com/autoscriptlabs/nccl-mesh-plugin && cd nccl-mesh-plugin && git checkout 19924dcc
+git apply ~/GLM-5.3-Flash-EXL3-DGX-Spark/patches/kernel/000{4,5,6}*.patch && make
+mkdir -p ~/nccl-mesh && cp -a libnccl-net.so libnccl-net-mesh.so ~/nccl-mesh/   # 2 台とも
+```
+
+- root は要らない (`verbs.h` は 2 台とも入っていた)。コンテナに読み取り専用でマウントされるだけ。
+- `make test-unit` は `test_error_paths` がリンクエラーでビルドできない (作者も既知の不具合としている)。
+  `tests/test_routing` を単独で実行し、13/13 で合格すればよい。
+- 2 本のケーブルが同じ 2 台の間をつなぐので、`NCCL_MESH_LINKS_PER_PEER=0` (自動) のまま。
+  生成 8 回の間に、`rocep1s0f0` と `roceP2p1s0f0` がそれぞれ約 12.6GB を送った。
+
+### パッチの木と overlay
+
+```bash
+R=~/GLM-5.3-Flash-EXL3-DGX-Spark; T=~/exl3-zeus/tp2d
+cp $R/tracks/tp2/patches/*.py $T/
+install -m 0755 $R/tracks/tp2/patches/tp2full-prelude.sh $T/tp2-prelude.sh && ln -f $T/tp2-prelude.sh $T/tp3-prelude.sh
+cp $R/tracks/tp3/patches/vision/{patch-vision-tp3,check-vision-mapping,check-vision-names,check-video-geometry}.py $T/
+cp $R/tracks/tp3/patches/patch-vllm-tp3.py $R/tracks/tp3/patches/prefix-hit-and-kpool-tail/patch-{prefixhit,kpooltail}-tp3.py $T/
+```
+
+- **高速起動のキャッシュは、この木の `patch-*.py` と prelude の中身から識別子を作る。** 初回起動 (dump) の前に完成させ、
+  その後はファイルを 1 つも足さない。足すと次の起動が拒否される。
+- prelude は 2 つの名前で**ハードリンク**にする (`tp3-prelude.sh` の名前でハッシュされるため)。
+- overlay (`$T/overlay/`) はイメージから取り出して作る。
+  1. `sparse_attn_indexer.py` と `sparse_attn_indexer_kpool.py` を `docker cp` で取り出す
+  2. `patches/indexer-overlay/0001`、`0002` を当てる
+  3. kpool のほうは読み取り専用でマウントされるので、`patch-indexer-workspace-tp3.py` を先に当てておく。
+     このスクリプトは `--root` の下の 2 ファイル (`v1/attention/backends/mla/indexer.py` と kpool) しか触らない。
+     その 2 つだけを置いたダミーの root を作り、ホストで実行した
+- 2 台の木が一致していることを md5 で確かめる (24 ファイル)。
+
+### env ファイル
+
+```bash
+sed -e "s/@NODE_RANK@/0/" -e "s/@HOST_IP@/10.0.1.60/" -e 's/@HEAD_IP@/10.0.1.60/' -e 's/@IFACE@/enP7s7/' \
+    -e 's|@HOME@|/home/j5ik2o|g' -e 's|@CKPT@|/home/j5ik2o/models/glm-5.3-flash-exl3-4.05bpw|' \
+    -e 's|@DRAFT_TP2@|/home/j5ik2o/models/dflash2-draft-tp2|' tracks/tp2/env.tp2-full.example > ~/exl3-zeus/.env.tp2-full
+# worker は NODE_RANK=1、HOST_IP=10.0.1.61
+```
+
+- **`MASTER_ADDR` と `HOST_IP` は LAN (10.0.1.x、`enP7s7`)。** 直結の 192.168.100.x にすると、何も出さずに止まる (作者の注意)。
+  RDMA のデバイスは mesh プラグインが自分で見つけるので、`NCCL_IB_GID_INDEX` は設定しない。
+- テンプレートは `FASTLOAD_MODE=load` になっている。**初回は `dump`** にしないと「キャッシュがない」で止まる。
+- `DRY_RUN=1 FABRIC_PREFIX=192.168.10 bash scripts/start-tp2full.sh 0` で `docker run` の全体を確認できる。
+- `tracks/tp2/patches/verify-cpu.sh` (GPU を使わない検査) は、自分のディレクトリをパッチの木とみなす。
+  `DIR=` の行を `~/exl3-zeus/tp2d` に書き換えたコピーで実行する。最後の動画の検査は `fixtures/` が無いと落ちるが、
+  本番の prelude はそのとき「SKIPPED」と出して先に進む。
+
+### 起動
+
+```bash
+# worker が先、head があと。各レシピのサーバー (vllm-fn など) は止めておく
+ssh spark-5083 'cd ~/GLM-5.3-Flash-EXL3-DGX-Spark && bash scripts/start-tp2full.sh 1'
+ssh spark-153d 'cd ~/GLM-5.3-Flash-EXL3-DGX-Spark && bash scripts/start-tp2full.sh 0'
+docker rm -f exl3-tp2   # 止めるとき (2 台とも)
+```
+
+- 初回 (dump) は、コンテナの起動から準備完了まで約 17.5 分。重みの読み込みが 162 秒で、高速起動のキャッシュ
+  (`/var/tmp/glm53-exl3-tp2d-r{0,1}`、1 台 79GB) を書き出す。2 回目からは env を `load` にすると約 4.7 分 (作者の値)。
+- KV は 16.63GiB、2,203,571 トークン (作者の値は 20.15GiB、259 万)。
+
+### 実績 (2026-09-19)
+
+`/v1/messages` + ツール呼び出し ✓ (作者は試していない)、画像 ✓ (左右 2 色の 64×32 画像で色を答えさせた、1 回)。
+
+**生成速度の測り方** (GLM と Qwen で同じ)
+
+- サンプル数: 4 種類のプロンプト × **各 2 回** (GLM は 2026-09-19 14:3x JST、Qwen は同日 05:2x JST)。
+  標本が少ないので、傾向を見る程度にとどめる。ばらつきの幅や信頼区間は出していない。
+- プロンプト (1 種類につき固定の 1 文):
+  - コード・英語 `Implement a simple LRU cache in Python and explain it.`
+  - 散文・英語 `Write a detailed prose essay about the four seasons in Japan.`
+  - コード・日本語 `Pythonで簡単なLRUキャッシュを実装して、解説して`
+  - 散文・日本語 `日本の四季について、それぞれの特徴を散文で詳しく書いて`
+- `/v1/chat/completions`、`max_tokens` 600 (8 回とも 600 トークンまで出た)、同時 1 本、ストリーミングなし。
+  温度などのサンプリングは指定せず、サーバーの既定値。
+- 値は `completion_tokens ÷ リクエスト全体の時間`。最初のトークンまでの時間 (入力の処理) も含む。入力が短いので影響は小さい。
+- 思考: GLM は `reasoning_effort: low` と `clear_thinking` (レシピの既定)、Qwen は `enable_thinking: false`。条件はそろっていない。
+- サーバーの設定: GLM は candidate D (DFlash2 で 7 トークン)、Qwen は MiaAI-Lab の Dual の既定 (MTP で 3 トークン、ドラフターは英語とコード向けの 4.7 万語)。
+
+表の値は 1 回目 / 2 回目 (tok/s)。
+
+| 内容 | GLM-5.3-Flash | Qwen3.8-Flash-Next |
+|---|---|---|
+| コード・英語 | 63.1 / 66.4 | 56.5 / 57.4 |
+| 散文・英語 | 30.7 / 29.5 | 35.8 / 37.4 |
+| コード・日本語の説明つき | 43.7 / 50.4 | 38.0 / 35.5 |
+| 散文・日本語 | 23.1 / 24.6 | 23.1 / 23.0 |
+
+- コードとツール呼び出しは GLM が速い (DFlash2 が 7 トークン先まで下書きし、コードではよく当たる)。英語の散文は Qwen が速い。
+- 入力の処理は、作者の値で GLM 1,413 tok/s、Qwen 2,960 tok/s。キャッシュが効かない往復は GLM のほうが遅い。
+- **エージェント用途の既知の限界**: 会話が約 3.6 万トークンを超えると壊れたツール呼び出しが出始め、約 7 万でループする
+  (`tracks/tp2/README.md`)。3 台構成で直した `index_topk` 8192 は、2 台では試されていない。
+
+### zsh の `$VAR:e` に注意
+
+`rsync ... $W:exl3-zeus/` のように書くと、zsh は `:e` を「拡張子を取り出す」修飾子として解釈する。
+`W=192.168.100.11` なら `11xl3-zeus/` という**ローカルの**パスになり、worker には何も届かない (rsync は成功扱い)。
+`"$W":exl3-zeus/`、`${W}:…`、または絶対パスで書く。
 
 ---
 
